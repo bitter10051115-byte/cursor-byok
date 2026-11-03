@@ -80,18 +80,7 @@ pub(crate) async fn post_stream(
     body: Bytes,
     on_request_sent: impl FnOnce() + Send + 'static,
 ) -> Result<reqwest::Response> {
-    headers.remove(UPSTREAM_URL_HEADER);
-    headers.remove(header::HOST);
-    headers.remove(header::CONTENT_LENGTH);
-    remove_hop_by_hop_headers(&mut headers);
-    headers.insert(
-        header::ACCEPT_ENCODING,
-        axum::http::HeaderValue::from_static("identity"),
-    );
-    headers.insert(
-        "connect-accept-encoding",
-        axum::http::HeaderValue::from_static("identity"),
-    );
+    headers = prepare_connect_stream_headers(headers);
     proxy
         .client()
         .await?
@@ -101,6 +90,35 @@ pub(crate) async fn post_stream(
         .send()
         .await
         .map_err(crate::Error::from)
+}
+
+/// `RunInferenceSSE` is server streaming. Reusing a unary `BidiAppend`
+/// `application/proto` header, or a content-encoding that describes that
+/// other body, makes api2 answer 415.
+pub(crate) fn prepare_connect_stream_headers(mut headers: HeaderMap) -> HeaderMap {
+    headers.remove(UPSTREAM_URL_HEADER);
+    headers.remove(header::HOST);
+    headers.remove(header::CONTENT_LENGTH);
+    headers.remove(header::CONTENT_ENCODING);
+    headers.remove("connect-content-encoding");
+    remove_hop_by_hop_headers(&mut headers);
+    headers.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/connect+proto"),
+    );
+    headers.insert(
+        "connect-protocol-version",
+        axum::http::HeaderValue::from_static("1"),
+    );
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        axum::http::HeaderValue::from_static("identity"),
+    );
+    headers.insert(
+        "connect-accept-encoding",
+        axum::http::HeaderValue::from_static("identity"),
+    );
+    headers
 }
 
 fn body_notifying_when_sent(
@@ -281,4 +299,46 @@ fn remove_hop_by_hop_headers(headers: &mut axum::http::HeaderMap) {
         headers.remove(name);
     }
     headers.remove("keep-alive");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_request_replaces_unary_media_type() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/proto"),
+        );
+        headers.insert(
+            header::CONTENT_ENCODING,
+            axum::http::HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            "connect-content-encoding",
+            axum::http::HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer test-token"),
+        );
+
+        let prepared = prepare_connect_stream_headers(headers);
+        assert_eq!(
+            prepared.get(header::CONTENT_TYPE).unwrap(),
+            "application/connect+proto"
+        );
+        assert_eq!(
+            prepared.get("connect-protocol-version").unwrap(),
+            "1"
+        );
+        assert!(prepared.get(header::CONTENT_ENCODING).is_none());
+        assert!(prepared.get("connect-content-encoding").is_none());
+        assert_eq!(
+            prepared.get(header::AUTHORIZATION).unwrap(),
+            "Bearer test-token"
+        );
+    }
 }
