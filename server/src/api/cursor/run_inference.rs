@@ -4,8 +4,8 @@ use std::{collections::HashMap, convert::Infallible, sync::Arc};
 use async_stream::stream;
 use axum::{
     body::{to_bytes, Body},
-    extract::State,
-    http::{header, HeaderValue, Request, Response, StatusCode},
+    extract::{Extension, State},
+    http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode},
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    api::cursor::proxy::{self, CursorProxy, UPSTREAM_URL_HEADER},
     cursor::{
         protocol::{
             connect::{self, END_STREAM_FLAG},
@@ -37,6 +38,8 @@ pub struct RunInferenceState {
 #[derive(Default)]
 struct InferenceRun {
     started: bool,
+    upstream_bridged: bool,
+    upstream_headers: Option<HeaderMap>,
     model: Option<ai::InferenceRequestedModel>,
     invocations: HashMap<String, CancellationToken>,
 }
@@ -104,6 +107,33 @@ impl RunInferenceState {
                 token.1.cancel();
             }
         }
+    }
+
+    async fn store_upstream_headers(&self, request_id: &str, headers: &HeaderMap) {
+        self.inner
+            .lock()
+            .await
+            .entry(request_id.to_owned())
+            .or_default()
+            .upstream_headers = Some(headers.clone());
+    }
+
+    async fn upstream_headers(&self, request_id: &str) -> Option<HeaderMap> {
+        self.inner
+            .lock()
+            .await
+            .get(request_id)
+            .and_then(|run| run.upstream_headers.clone())
+    }
+
+    async fn begin_upstream_bridge(&self, request_id: &str) -> bool {
+        let mut runs = self.inner.lock().await;
+        let run = runs.entry(request_id.to_owned()).or_default();
+        if run.upstream_bridged {
+            return false;
+        }
+        run.upstream_bridged = true;
+        true
     }
 }
 
@@ -845,8 +875,191 @@ fn finish_stream(handle: &TransportHandle) {
     handle.close_transport();
 }
 
+const OFFICIAL_INFERENCE_SSE: &str = "/aiserver.v1.InferenceService/RunInferenceSSE";
+const UPSTREAM_STREAM_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Connects an official model turn to Cursor and copies its frames into the
+/// local `RunInferenceSSE` subscription the client is already reading.
+pub(crate) async fn ensure_upstream_bridge(
+    registry: &TransportRegistry,
+    state: &RunInferenceState,
+    proxy: &CursorProxy,
+    request_id: &str,
+    headers: &HeaderMap,
+) {
+    state.store_upstream_headers(request_id, headers).await;
+    let Some(handle) = registry.local(request_id).await else {
+        return;
+    };
+    if !state.begin_upstream_bridge(request_id).await {
+        return;
+    }
+    let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+    let notify_sent = ready.clone();
+    let notified = ready.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let proxy = proxy.clone();
+    let request_id = request_id.to_owned();
+    let headers = headers.clone();
+    tokio::spawn(async move {
+        let _ready = NotifyOnDrop(ready);
+        bridge_official_inference(
+            proxy,
+            request_id,
+            headers,
+            handle,
+            move || notify_sent.notify_one(),
+        )
+        .await;
+    });
+    let _ = tokio::time::timeout(UPSTREAM_STREAM_READY_TIMEOUT, notified).await;
+}
+
+async fn resume_upstream_bridge(
+    registry: &TransportRegistry,
+    state: &RunInferenceState,
+    proxy: &CursorProxy,
+    request_id: &str,
+) {
+    if !registry.upstream(request_id).await {
+        return;
+    }
+    let Some(headers) = state.upstream_headers(request_id).await else {
+        return;
+    };
+    ensure_upstream_bridge(registry, state, proxy, request_id, &headers).await;
+}
+
+struct NotifyOnDrop(std::sync::Arc<tokio::sync::Notify>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+async fn bridge_official_inference(
+    proxy: CursorProxy,
+    request_id: String,
+    headers: HeaderMap,
+    handle: TransportHandle,
+    on_request_sent: impl FnOnce() + Send + 'static,
+) {
+    let url = match official_inference_url(&headers) {
+        Ok(url) => url,
+        Err(error) => {
+            tracing::error!(request_id, %error, "official inference URL rejected");
+            emit_bridge_error(&handle, &error.to_string());
+            return;
+        }
+    };
+    let body = match connect::encode_message(&ai::BidiRequestId {
+        request_id: request_id.clone(),
+    }) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(
+                request_id,
+                %error,
+                "official inference request encoding failed"
+            );
+            emit_bridge_error(&handle, &error.to_string());
+            return;
+        }
+    };
+    tracing::info!(request_id, %url, "opening official inference stream");
+    let response = match proxy::post_stream(&proxy, url, headers, body, on_request_sent).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(request_id, %error, "official inference stream failed");
+            emit_bridge_error(&handle, &error.to_string());
+            return;
+        }
+    };
+    let status = response.status();
+    tracing::info!(request_id, %status, "official inference stream responded");
+    if !status.is_success() {
+        emit_bridge_error(
+            &handle,
+            &format!("official inference stream returned {status}"),
+        );
+        return;
+    }
+    let mut stream = std::pin::pin!(response.bytes_stream());
+    loop {
+        tokio::select! {
+            biased;
+            _ = handle.disconnect_token().cancelled() => break,
+            chunk = stream.next() => {
+                match chunk {
+                    Some(Ok(chunk)) if !chunk.is_empty() => {
+                        if !handle.emit_frame(chunk) {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        tracing::error!(
+                            request_id,
+                            %error,
+                            "official inference stream interrupted"
+                        );
+                        emit_bridge_error(&handle, &error.to_string());
+                        return;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    handle.close_output();
+}
+
+fn emit_bridge_error(handle: &TransportHandle, message: &str) {
+    let error = connect::ConnectStreamError {
+        code: connect::ConnectCode::Unavailable,
+        message: message.to_owned(),
+        details: Vec::new(),
+    };
+    if let Ok(frame) = connect::encode_error_end_stream(&error) {
+        handle.emit_frame(frame);
+    }
+    handle.close_output();
+}
+
+pub(crate) fn official_inference_url(headers: &HeaderMap) -> Result<String> {
+    let origin = if let Some(value) = headers.get(UPSTREAM_URL_HEADER) {
+        let value = value.to_str().map_err(|error| {
+            Error::Protocol(format!("invalid upstream URL header: {error}"))
+        })?;
+        let url = reqwest::Url::parse(value)
+            .map_err(|error| Error::Protocol(format!("invalid upstream URL: {error}")))?;
+        let host = url.host_str().unwrap_or_default();
+        if url.scheme() != "https" || !crate::local_app::proxy_host_allowed(host) {
+            return Err(Error::Protocol(
+                "upstream URL must target a Cursor HTTPS host".into(),
+            ));
+        }
+        let port = url
+            .port()
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        format!("https://{host}{port}")
+    } else {
+        proxy::cursor_upstream().to_owned()
+    };
+    Ok(format!(
+        "{}{}",
+        origin.trim_end_matches('/'),
+        OFFICIAL_INFERENCE_SSE
+    ))
+}
+
 pub async fn sse(
     State(registry): State<TransportRegistry>,
+    Extension(proxy): Extension<CursorProxy>,
+    Extension(state): Extension<RunInferenceState>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let body = to_bytes(request.into_body(), usize::MAX)
@@ -854,6 +1067,7 @@ pub async fn sse(
         .map_err(|error| Error::Protocol(format!("cannot read RunInferenceSSE body: {error}")))?;
     let request: ai::BidiRequestId = connect::decode_unary(&body)?;
     let handle = registry.get_or_create(&request.request_id).await?;
+    resume_upstream_bridge(&registry, &state, &proxy, &request.request_id).await;
     let mut receiver = handle.subscribe();
     let body = stream! {
         let mut guard = StreamGuard::new(handle.clone());
@@ -885,6 +1099,8 @@ pub async fn sse(
 
 pub async fn poll(
     State(registry): State<TransportRegistry>,
+    Extension(proxy): Extension<CursorProxy>,
+    Extension(state): Extension<RunInferenceState>,
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     let body = to_bytes(request.into_body(), usize::MAX)
@@ -898,6 +1114,7 @@ pub async fn poll(
         .filter(|id| !id.is_empty())
         .ok_or_else(|| Error::Protocol("RunInferencePoll request_id is required".into()))?;
     let handle = registry.get_or_create(request_id).await?;
+    resume_upstream_bridge(&registry, &state, &proxy, request_id).await;
     let mut receiver = handle.subscribe();
     let body = stream! {
         let mut guard = StreamGuard::new(handle.clone());
@@ -996,6 +1213,32 @@ mod tests {
                 data,
             }),
         }
+    }
+
+    #[test]
+    fn official_inference_url_keeps_the_cursor_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UPSTREAM_URL_HEADER,
+            HeaderValue::from_static(
+                "https://api2.cursor.sh/aiserver.v1.BidiService/BidiAppend",
+            ),
+        );
+        assert_eq!(
+            official_inference_url(&headers).unwrap(),
+            "https://api2.cursor.sh/aiserver.v1.InferenceService/RunInferenceSSE"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            UPSTREAM_URL_HEADER,
+            HeaderValue::from_static("https://evil.example/aiserver.v1.BidiService/BidiAppend"),
+        );
+        assert!(official_inference_url(&headers).is_err());
+        assert_eq!(
+            official_inference_url(&HeaderMap::new()).unwrap(),
+            "https://api2.cursor.sh/aiserver.v1.InferenceService/RunInferenceSSE"
+        );
     }
 
     #[test]

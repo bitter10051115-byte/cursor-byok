@@ -4,13 +4,17 @@ use std::time::Instant;
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::Extension,
-    http::{header, Request, Response},
+    http::{header, HeaderMap, Request, Response},
 };
 
 use crate::Result;
 
 const CURSOR_UPSTREAM: &str = "https://api2.cursor.sh";
 pub const UPSTREAM_URL_HEADER: &str = "x-server-upstream-url";
+
+pub(crate) fn cursor_upstream() -> &'static str {
+    CURSOR_UPSTREAM
+}
 
 #[derive(Clone)]
 pub struct CursorProxy {
@@ -63,6 +67,59 @@ pub async fn forward(
     request: Request<Body>,
 ) -> Result<Response<Body>> {
     forward_request(&proxy, request, None).await
+}
+
+/// Opens one upstream stream and reports once its request body has been sent.
+///
+/// The callback runs before response headers arrive, so the caller can submit
+/// the matching write (`BidiAppend`) after the read stream exists.
+pub(crate) async fn post_stream(
+    proxy: &CursorProxy,
+    url: String,
+    mut headers: HeaderMap,
+    body: Bytes,
+    on_request_sent: impl FnOnce() + Send + 'static,
+) -> Result<reqwest::Response> {
+    headers.remove(UPSTREAM_URL_HEADER);
+    headers.remove(header::HOST);
+    headers.remove(header::CONTENT_LENGTH);
+    remove_hop_by_hop_headers(&mut headers);
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        axum::http::HeaderValue::from_static("identity"),
+    );
+    headers.insert(
+        "connect-accept-encoding",
+        axum::http::HeaderValue::from_static("identity"),
+    );
+    proxy
+        .client()
+        .await?
+        .post(url)
+        .headers(headers)
+        .body(body_notifying_when_sent(body, on_request_sent))
+        .send()
+        .await
+        .map_err(crate::Error::from)
+}
+
+fn body_notifying_when_sent(
+    body: Bytes,
+    on_request_sent: impl FnOnce() + Send + 'static,
+) -> reqwest::Body {
+    struct NotifyOnDrop<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for NotifyOnDrop<F> {
+        fn drop(&mut self) {
+            if let Some(callback) = self.0.take() {
+                callback();
+            }
+        }
+    }
+    let notify = NotifyOnDrop(Some(on_request_sent));
+    reqwest::Body::wrap_stream(async_stream::stream! {
+        let _notify = notify;
+        yield Ok::<Bytes, std::io::Error>(body);
+    })
 }
 
 pub(crate) async fn forward_to_service(

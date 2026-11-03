@@ -249,30 +249,30 @@ async fn bidi_handler(
     let conversation_id = decoded.conversation_id().map(str::to_owned);
     let trace_metadata = decoded.trace_metadata();
     let trace = registry.trace(&decoded.request_id);
-    let local = if let Some(model_id) = decoded.model_id() {
+    let model_is_local = if let Some(model_id) = decoded.model_id() {
         // 插件模型 ID 只在本地有意义,永远不转发到 Cursor 官方上游。
-        if model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
-            || registry.store().model(model_id).await?.is_some()
-        {
+        let local = model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX)
+            || registry.store().model(model_id).await?.is_some();
+        if local {
             tracing::info!(
                 request_id = decoded.request_id,
                 model_id,
                 "routing Cursor Run to BYOK provider"
             );
-            true
         } else {
             tracing::info!(
                 request_id = decoded.request_id,
                 model_id,
                 "routing Cursor Run to Cursor upstream"
             );
-            false
         }
-    } else if registry.local(&decoded.request_id).await.is_some() {
-        true
-    } else if registry.upstream(&decoded.request_id).await {
-        false
+        Some(local)
     } else {
+        None
+    };
+    let has_upstream = registry.upstream(&decoded.request_id).await;
+    let has_local = registry.local(&decoded.request_id).await.is_some();
+    let Some(local) = route_is_local(model_is_local, has_upstream, has_local) else {
         trace.resume();
         trace.request(
             "bidi_request",
@@ -300,6 +300,16 @@ async fn bidi_handler(
         if first_model.is_some() {
             registry.mark_upstream(&decoded.request_id).await;
         }
+        // 官方模型的读通道是已经打开的本地 RunInferenceSSE。先把官方回复流
+        // 接上，再转发这次写入，官方帧才会回到客户端正在读的那条连接。
+        run_inference::ensure_upstream_bridge(
+            &registry,
+            &state,
+            &proxy,
+            &decoded.request_id,
+            &parts.headers,
+        )
+        .await;
         trace.request(
             "bidi_request",
             body.clone(),
@@ -356,6 +366,27 @@ async fn bidi_handler(
     Ok(response)
 }
 
+/// `None` means the first append did not select a model and no route exists yet.
+fn route_is_local(
+    model_is_local: Option<bool>,
+    has_upstream: bool,
+    has_local: bool,
+) -> Option<bool> {
+    if let Some(local) = model_is_local {
+        return Some(local);
+    }
+    // RunInferenceSSE creates a local subscription before the model is known.
+    // Once this turn is official, later appends must stay on that upstream
+    // route; otherwise tool results never reach Cursor.
+    if has_upstream {
+        return Some(false);
+    }
+    if has_local {
+        return Some(true);
+    }
+    None
+}
+
 fn trace_outcome(
     mut metadata: serde_json::Value,
     accepted: bool,
@@ -392,6 +423,20 @@ fn parent_headers(headers: &HeaderMap) -> Result<Option<TransportParent>> {
         _ => Err(crate::Error::Protocol(
             "Cursor subagent request must include both parent headers".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_is_local;
+
+    #[test]
+    fn official_appends_stay_upstream_after_the_inference_subscription() {
+        assert_eq!(route_is_local(Some(false), false, true), Some(false));
+        assert_eq!(route_is_local(None, true, true), Some(false));
+        assert_eq!(route_is_local(Some(true), true, true), Some(true));
+        assert_eq!(route_is_local(None, false, true), Some(true));
+        assert_eq!(route_is_local(None, false, false), None);
     }
 }
 
