@@ -85,22 +85,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64
-            os: ubuntu-22.04
-            args: ""
-            target: ""
           - platform: windows-x86_64
             os: windows-latest
             args: "--bundles nsis"
             target: ""
-          - platform: macos-aarch64
-            os: macos-15
-            args: "--target aarch64-apple-darwin"
-            target: aarch64-apple-darwin
-          - platform: macos-x86_64
-            os: macos-15-intel
-            args: "--target x86_64-apple-darwin"
-            target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
 

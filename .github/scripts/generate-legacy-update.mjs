@@ -3,10 +3,7 @@ import { stat, readFile, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 const assetSpecs = [
-  ["macos-arm64", ".tar.gz"],
-  ["macos-amd64", ".tar.gz"],
   ["windows-amd64", ".zip"],
-  ["linux-amd64", ".tar.gz"],
 ];
 
 function readOptions(args) {
