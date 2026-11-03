@@ -989,6 +989,9 @@ async fn bridge_official_inference(
     }
     let disconnect = handle.disconnect_token();
     let mut stream = std::pin::pin!(response.bytes_stream());
+    let mut envelopes = connect::EnvelopeBuffer::new();
+    let mut forwarded = 0_u64;
+    let mut bytes = 0_u64;
     loop {
         tokio::select! {
             biased;
@@ -996,8 +999,25 @@ async fn bridge_official_inference(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(chunk)) if !chunk.is_empty() => {
-                        if !handle.emit_frame(chunk) {
-                            break;
+                        let frames = match envelopes.push(&chunk) {
+                            Ok(frames) => frames,
+                            Err(error) => {
+                                tracing::error!(
+                                    request_id,
+                                    %error,
+                                    "official inference envelope rejected"
+                                );
+                                emit_bridge_error(&handle, &error.to_string());
+                                return;
+                            }
+                        };
+                        for frame in frames {
+                            bytes += frame.len() as u64;
+                            forwarded += 1;
+                            if !handle.emit_frame(frame) {
+                                handle.close_output();
+                                return;
+                            }
                         }
                     }
                     Some(Ok(_)) => {}
@@ -1015,6 +1035,28 @@ async fn bridge_official_inference(
             }
         }
     }
+    if disconnect.is_cancelled() {
+        handle.close_output();
+        return;
+    }
+    if !envelopes.is_empty() {
+        tracing::error!(
+            request_id,
+            buffered = envelopes.buffered(),
+            "official inference stream ended inside an envelope"
+        );
+        emit_bridge_error(
+            &handle,
+            "official inference stream ended inside an envelope",
+        );
+        return;
+    }
+    tracing::info!(
+        request_id,
+        frames = forwarded,
+        bytes,
+        "official inference stream forwarded"
+    );
     handle.close_output();
 }
 
@@ -1074,9 +1116,7 @@ pub async fn sse(
     let body = stream! {
         let mut guard = StreamGuard::new(handle.clone());
         while let Some(frame) = receiver.recv().await {
-            let terminal = frame
-                .first()
-                .is_some_and(|flags| flags & END_STREAM_FLAG != 0);
+            let terminal = connect::is_end_stream_frame(&frame);
             yield Ok::<Bytes, Infallible>(frame);
             if terminal {
                 guard.done();
@@ -1122,9 +1162,7 @@ pub async fn poll(
         let mut guard = StreamGuard::new(handle.clone());
         let mut seqno = 1_i64;
         while let Some(frame) = receiver.recv().await {
-            let terminal = frame
-                .first()
-                .is_some_and(|flags| flags & END_STREAM_FLAG != 0);
+            let terminal = connect::is_end_stream_frame(&frame);
             let data = if terminal {
                 String::new()
             } else {

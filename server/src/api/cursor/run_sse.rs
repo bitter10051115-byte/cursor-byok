@@ -49,7 +49,7 @@ fn local_body_stream(
         let mut guard = LocalRunGuard::new(handle);
         let mut trace = TraceStreamSink::new(trace, "byok_server");
         while let Some(chunk) = receiver.recv().await {
-            let terminal = is_end_stream_frame(&chunk);
+            let terminal = connect::is_end_stream_frame(&chunk);
             trace.chunk(&chunk);
             if terminal {
                 guard.complete();
@@ -63,12 +63,6 @@ fn local_body_stream(
         guard.complete();
         trace.finish(None);
     }
-}
-
-fn is_end_stream_frame(frame: &Bytes) -> bool {
-    frame
-        .first()
-        .is_some_and(|flags| flags & END_STREAM_FLAG != 0)
 }
 
 fn end_stream_error(frame: &Bytes) -> Option<String> {
