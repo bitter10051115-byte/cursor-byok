@@ -896,6 +896,7 @@ pub(crate) async fn ensure_upstream_bridge(
     }
     let ready = std::sync::Arc::new(tokio::sync::Notify::new());
     let notify_sent = ready.clone();
+    let task_ready = ready.clone();
     let notified = ready.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
@@ -903,7 +904,7 @@ pub(crate) async fn ensure_upstream_bridge(
     let request_id = request_id.to_owned();
     let headers = headers.clone();
     tokio::spawn(async move {
-        let _ready = NotifyOnDrop(ready);
+        let _ready = NotifyOnDrop(task_ready);
         bridge_official_inference(
             proxy,
             request_id,
@@ -986,11 +987,12 @@ async fn bridge_official_inference(
         );
         return;
     }
+    let disconnect = handle.disconnect_token();
     let mut stream = std::pin::pin!(response.bytes_stream());
     loop {
         tokio::select! {
             biased;
-            _ = handle.disconnect_token().cancelled() => break,
+            _ = disconnect.cancelled() => break,
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(chunk)) if !chunk.is_empty() => {
