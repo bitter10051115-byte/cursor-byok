@@ -227,27 +227,16 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         .map(|id| id.request_id.as_str())
         .filter(|id| !id.is_empty())
         .ok_or_else(|| Error::Protocol("BidiAppend request_id is required".into()))?;
-    if !request.data_binary.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend data_binary is not part of the captured protocol".into(),
-        ));
-    }
-    if request.data.is_empty() {
-        return Err(Error::Protocol(
-            "BidiAppend contains no client message".into(),
-        ));
-    }
-    let payload = hex::decode(&request.data)
-        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
-    let message = if let Ok(message) = agent::AgentClientMessage::decode(payload.as_slice()) {
+    let payload = message_bytes(request)?;
+    let message = if let Ok(message) = agent::AgentClientMessage::decode(payload.as_ref()) {
         DecodedMessage::Agent(Box::new(message))
-    } else if let Ok(message) = ai::RunInferenceClientMessage::decode(payload.as_slice()) {
+    } else if let Ok(message) = ai::RunInferenceClientMessage::decode(payload.as_ref()) {
         DecodedMessage::Inference(Box::new(message))
     } else {
         tracing::warn!(
             request_id = %request_id,
             append_seqno = request.append_seqno,
-            payload = %request.data,
+            payload_bytes = payload.len(),
             "BidiAppend contained neither AgentClientMessage nor RunInferenceClientMessage"
         );
         return Err(Error::Protocol(
@@ -259,6 +248,29 @@ pub fn decode(request: &ai::BidiAppendRequest) -> Result<DecodedAppend> {
         seqno: request.append_seqno,
         message,
     })
+}
+
+/// Cursor sends the client message in exactly one field. `data` is the hex
+/// encoding used by older clients. `data_binary` is the same protobuf bytes,
+/// selected when `bidi_append_binary_encoding_disabled` is off.
+fn message_bytes(request: &ai::BidiAppendRequest) -> Result<std::borrow::Cow<'_, [u8]>> {
+    let binary = request.data_binary.as_slice();
+    if request.data.is_empty() {
+        if binary.is_empty() {
+            return Err(Error::Protocol(
+                "BidiAppend contains no client message".into(),
+            ));
+        }
+        return Ok(std::borrow::Cow::Borrowed(binary));
+    }
+    let decoded = hex::decode(&request.data)
+        .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
+    if !binary.is_empty() && binary != decoded.as_slice() {
+        return Err(Error::Protocol(
+            "BidiAppend data and data_binary contain different messages".into(),
+        ));
+    }
+    Ok(std::borrow::Cow::Owned(decoded))
 }
 
 pub async fn append(
@@ -376,5 +388,54 @@ mod tests {
             .selected_subagent_models
             .iter()
             .any(|model| model.model_id == "grok-4.7"));
+    }
+
+    #[test]
+    fn decodes_the_same_run_inference_append_from_data_binary() {
+        let request = ai::BidiAppendRequest {
+            data: String::new(),
+            request_id: Some(ai::BidiRequestId {
+                request_id: "captured-run".into(),
+            }),
+            append_seqno: 1,
+            data_binary: hex::decode(CAPTURED_RUN_INFERENCE_PAYLOAD).expect("fixture hex"),
+        };
+        let decoded = decode(&request).expect("binary RunInference payload must decode");
+        let DecodedMessage::Inference(message) = decoded.message else {
+            panic!("expected RunInferenceClientMessage");
+        };
+        let ai::run_inference_client_message::Message::RunRequest(request) =
+            message.message.expect("RunRequest message")
+        else {
+            panic!("expected RunRequest");
+        };
+        assert_eq!(
+            request.conversation_id,
+            "7c353fa4-50a8-485b-89c1-aa7d35408cfd"
+        );
+        assert_eq!(
+            request
+                .requested_model
+                .as_ref()
+                .expect("requested_model")
+                .model_id,
+            "2ac720b73432b262"
+        );
+    }
+
+    #[test]
+    fn rejects_data_binary_that_disagrees_with_hex_data() {
+        let mut binary = hex::decode(CAPTURED_RUN_INFERENCE_PAYLOAD).expect("fixture hex");
+        binary[0] ^= 0xff;
+        let request = ai::BidiAppendRequest {
+            data: CAPTURED_RUN_INFERENCE_PAYLOAD.into(),
+            request_id: Some(ai::BidiRequestId {
+                request_id: "captured-run".into(),
+            }),
+            append_seqno: 1,
+            data_binary: binary,
+        };
+        let error = decode(&request).expect_err("disagreeing payloads must be rejected");
+        assert!(error.to_string().contains("different messages"), "{error}");
     }
 }
