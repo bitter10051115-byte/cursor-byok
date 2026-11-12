@@ -89,6 +89,10 @@ jobs:
             os: windows-latest
             args: "--bundles nsis"
             target: ""
+          - platform: macos-aarch64
+            os: macos-15
+            args: "--target aarch64-apple-darwin"
+            target: aarch64-apple-darwin
 
     runs-on: ${{ matrix.os }}
 
@@ -246,6 +250,14 @@ jobs:
             -H "Accept: application/octet-stream" \
             "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
             > tauri-update/latest.json
+          mkdir -p updater-sigs
+          gh release download "v${VERSION}" --dir updater-sigs --pattern "*.sig" --clobber
+          node .github/scripts/merge-updater-platforms.mjs \
+            --manifest tauri-update/latest.json \
+            --release tauri-update/release.json \
+            --signatures updater-sigs \
+            --repository "${GITHUB_REPOSITORY}" \
+            --version "${VERSION}"
           node .github/scripts/normalize-tauri-update.mjs \
             --manifest tauri-update/latest.json \
             --release tauri-update/release.json \
